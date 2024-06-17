@@ -4,6 +4,8 @@ from libcpp.string cimport string
 from libcpp.utility cimport move
 from libcpp.vector cimport vector
 
+from cudf._lib.pylibcudf.io.datasource cimport Datasource
+from cudf._lib.pylibcudf.libcudf.io.datasource cimport datasource
 from cudf._lib.pylibcudf.libcudf.io.types cimport (
     host_buffer,
     source_info,
@@ -92,6 +94,7 @@ cdef class SourceInfo:
             raise ValueError("Need to pass at least one source")
 
         cdef vector[string] c_files
+        cdef vector[datasource*] c_datasources
 
         if isinstance(sources[0], (os.PathLike, str)):
             c_files.reserve(len(sources))
@@ -107,6 +110,13 @@ cdef class SourceInfo:
                 c_files.push_back(<string> str(src).encode())
 
             self.c_obj = move(source_info(c_files))
+            return
+        elif isinstance(sources[0], Datasource):
+            for csrc in sources:
+                if not isinstance(csrc, Datasource):
+                    raise ValueError("All sources must be of the same type!")
+                c_datasources.push_back((<Datasource>csrc).get_datasource())
+            self.c_obj = move(source_info(c_datasources))
             return
 
         # TODO: host_buffer is deprecated API, use host_span instead
@@ -130,5 +140,11 @@ cdef class SourceInfo:
                 c_buffer = bio.getbuffer()  # check if empty?
                 c_host_buffers.push_back(host_buffer(<char*>&c_buffer[0],
                                                      c_buffer.shape[0]))
+        else:
+            raise ValueError("Sources must be a list of str/paths, "
+                             "bytes, or io.BytesIO")
+
+        if empty_buffer is True:
+            c_host_buffers.push_back(host_buffer(<char*>NULL, 0))
 
         self.c_obj = source_info(c_host_buffers)

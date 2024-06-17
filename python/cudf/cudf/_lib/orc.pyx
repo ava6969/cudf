@@ -11,7 +11,6 @@ from libcpp.string cimport string
 from libcpp.utility cimport move
 from libcpp.vector cimport vector
 
-import datetime
 from collections import OrderedDict
 
 cimport cudf._lib.pylibcudf.libcudf.lists.lists_column_view as cpp_lists_column_view
@@ -23,33 +22,14 @@ except ImportError:
 
 cimport cudf._lib.pylibcudf.libcudf.io.types as cudf_io_types
 from cudf._lib.column cimport Column
-from cudf._lib.io.datasource cimport NativeFileDatasource
-from cudf._lib.io.utils cimport (
-    make_sink_info,
-    make_source_info,
-    update_col_struct_field_names,
-)
+from cudf._lib.io.utils cimport make_sink_info, update_col_struct_field_names
+from cudf._lib.pylibcudf.io.datasource cimport NativeFileDatasource
 from cudf._lib.pylibcudf.libcudf.io.data_sink cimport data_sink
 from cudf._lib.pylibcudf.libcudf.io.orc cimport (
     chunked_orc_writer_options,
     orc_chunked_writer,
     orc_writer_options,
     write_orc as libcudf_write_orc,
-)
-from cudf._lib.pylibcudf.libcudf.io.orc_metadata cimport (
-    binary_statistics,
-    bucket_statistics,
-    column_statistics,
-    date_statistics,
-    decimal_statistics,
-    double_statistics,
-    integer_statistics,
-    no_statistics,
-    parsed_orc_statistics,
-    read_parsed_orc_statistics as libcudf_read_parsed_orc_statistics,
-    statistics_type,
-    string_statistics,
-    timestamp_statistics,
 )
 from cudf._lib.pylibcudf.libcudf.io.types cimport (
     column_in_metadata,
@@ -58,7 +38,6 @@ from cudf._lib.pylibcudf.libcudf.io.types cimport (
     table_input_metadata,
 )
 from cudf._lib.pylibcudf.libcudf.table.table_view cimport table_view
-from cudf._lib.variant cimport get_if as std_get_if, holds_alternative
 
 from cudf._lib.types import SUPPORTED_NUMPY_TO_PYLIBCUDF_TYPES
 
@@ -68,125 +47,6 @@ from pyarrow.lib import NativeFile
 
 import cudf._lib.pylibcudf as plc
 from cudf._lib.utils import _index_level_name, generate_pandas_metadata
-
-
-cdef _parse_column_type_statistics(column_statistics stats):
-    # Initialize stats to return and parse stats blob
-    column_stats = {}
-
-    if stats.number_of_values.has_value():
-        column_stats["number_of_values"] = stats.number_of_values.value()
-
-    if stats.has_null.has_value():
-        column_stats["has_null"] = stats.has_null.value()
-
-    cdef statistics_type type_specific_stats = stats.type_specific_stats
-
-    cdef integer_statistics* int_stats
-    cdef double_statistics* dbl_stats
-    cdef string_statistics* str_stats
-    cdef bucket_statistics* bucket_stats
-    cdef decimal_statistics* dec_stats
-    cdef date_statistics* date_stats
-    cdef binary_statistics* bin_stats
-    cdef timestamp_statistics* ts_stats
-
-    if holds_alternative[no_statistics](type_specific_stats):
-        return column_stats
-    elif int_stats := std_get_if[integer_statistics](&type_specific_stats):
-        if int_stats.minimum.has_value():
-            column_stats["minimum"] = int_stats.minimum.value()
-        else:
-            column_stats["minimum"] = None
-        if int_stats.maximum.has_value():
-            column_stats["maximum"] = int_stats.maximum.value()
-        else:
-            column_stats["maximum"] = None
-        if int_stats.sum.has_value():
-            column_stats["sum"] = int_stats.sum.value()
-        else:
-            column_stats["sum"] = None
-    elif dbl_stats := std_get_if[double_statistics](&type_specific_stats):
-        if dbl_stats.minimum.has_value():
-            column_stats["minimum"] = dbl_stats.minimum.value()
-        else:
-            column_stats["minimum"] = None
-        if dbl_stats.maximum.has_value():
-            column_stats["maximum"] = dbl_stats.maximum.value()
-        else:
-            column_stats["maximum"] = None
-        if dbl_stats.sum.has_value():
-            column_stats["sum"] = dbl_stats.sum.value()
-        else:
-            column_stats["sum"] = None
-    elif str_stats := std_get_if[string_statistics](&type_specific_stats):
-        if str_stats.minimum.has_value():
-            column_stats["minimum"] = str_stats.minimum.value().decode("utf-8")
-        else:
-            column_stats["minimum"] = None
-        if str_stats.maximum.has_value():
-            column_stats["maximum"] = str_stats.maximum.value().decode("utf-8")
-        else:
-            column_stats["maximum"] = None
-        if str_stats.sum.has_value():
-            column_stats["sum"] = str_stats.sum.value()
-        else:
-            column_stats["sum"] = None
-    elif bucket_stats := std_get_if[bucket_statistics](&type_specific_stats):
-        column_stats["true_count"] = bucket_stats.count[0]
-        column_stats["false_count"] = (
-            column_stats["number_of_values"]
-            - column_stats["true_count"]
-        )
-    elif dec_stats := std_get_if[decimal_statistics](&type_specific_stats):
-        if dec_stats.minimum.has_value():
-            column_stats["minimum"] = dec_stats.minimum.value().decode("utf-8")
-        else:
-            column_stats["minimum"] = None
-        if dec_stats.maximum.has_value():
-            column_stats["maximum"] = dec_stats.maximum.value().decode("utf-8")
-        else:
-            column_stats["maximum"] = None
-        if dec_stats.sum.has_value():
-            column_stats["sum"] = dec_stats.sum.value().decode("utf-8")
-        else:
-            column_stats["sum"] = None
-    elif date_stats := std_get_if[date_statistics](&type_specific_stats):
-        if date_stats.minimum.has_value():
-            column_stats["minimum"] = datetime.datetime.fromtimestamp(
-                datetime.timedelta(date_stats.minimum.value()).total_seconds(),
-                datetime.timezone.utc,
-            )
-        else:
-            column_stats["minimum"] = None
-        if date_stats.maximum.has_value():
-            column_stats["maximum"] = datetime.datetime.fromtimestamp(
-                datetime.timedelta(date_stats.maximum.value()).total_seconds(),
-                datetime.timezone.utc,
-            )
-        else:
-            column_stats["maximum"] = None
-    elif bin_stats := std_get_if[binary_statistics](&type_specific_stats):
-        if bin_stats.sum.has_value():
-            column_stats["sum"] = bin_stats.sum.value()
-        else:
-            column_stats["sum"] = None
-    elif ts_stats := std_get_if[timestamp_statistics](&type_specific_stats):
-        # Before ORC-135, the local timezone offset was included and they were
-        # stored as minimum and maximum. After ORC-135, the timestamp is
-        # adjusted to UTC before being converted to milliseconds and stored
-        # in minimumUtc and maximumUtc.
-        # TODO: Support minimum and maximum by reading writer's local timezone
-        if ts_stats.minimum_utc.has_value() and ts_stats.maximum_utc.has_value():
-            column_stats["minimum"] = datetime.datetime.fromtimestamp(
-                ts_stats.minimum_utc.value() / 1000, datetime.timezone.utc
-            )
-            column_stats["maximum"] = datetime.datetime.fromtimestamp(
-                ts_stats.maximum_utc.value() / 1000, datetime.timezone.utc
-            )
-    else:
-        raise ValueError("Unsupported statistics type")
-    return column_stats
 
 
 cpdef read_parsed_orc_statistics(filepath_or_buffer):
@@ -202,22 +62,24 @@ cpdef read_parsed_orc_statistics(filepath_or_buffer):
     if isinstance(filepath_or_buffer, NativeFile):
         filepath_or_buffer = NativeFileDatasource(filepath_or_buffer)
 
-    cdef parsed_orc_statistics parsed = (
-        libcudf_read_parsed_orc_statistics(make_source_info([filepath_or_buffer]))
+    parsed = (
+        plc.io.orc.read_parsed_orc_statistics(
+            plc.io.SourceInfo([filepath_or_buffer])
+        )
     )
 
-    cdef vector[column_statistics] file_stats = parsed.file_stats
-    cdef vector[vector[column_statistics]] stripes_stats = parsed.stripes_stats
+    file_stats = parsed.file_stats
+    stripes_stats = parsed.stripes_stats
 
     parsed_file_stats = [
-        _parse_column_type_statistics(file_stats[column_index])
-        for column_index in range(file_stats.size())
+        file_stat
+        for file_stat in file_stats
     ]
 
     parsed_stripes_stats = [
-        [_parse_column_type_statistics(stripes_stats[stripe_index][column_index])
-         for column_index in range(stripes_stats[stripe_index].size())]
-        for stripe_index in range(stripes_stats.size())
+        [col_stat
+         for col_stat in stripes_stat]
+        for stripes_stat in stripes_stats
     ]
 
     return parsed.column_names, parsed_file_stats, parsed_stripes_stats
