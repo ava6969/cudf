@@ -8,9 +8,11 @@ import polars as pl
 
 from cudf_polars.dsl import expr
 from cudf_polars.testing.asserts import assert_gpu_result_equal
+from cudf_polars.callback import execute_with_cudf
 
 
-@pytest.fixture(params=sorted(expr.Agg._SUPPORTED))
+# Note: quantile is tested separately (since it takes another argument)
+@pytest.fixture(params=sorted(expr.Agg._SUPPORTED - {"quantile"}))
 def agg(request):
     return request.param
 
@@ -47,8 +49,6 @@ def df(dtype, with_nulls, is_sorted):
 
 
 def test_agg(df, agg):
-    if agg == "quantile":
-        pytest.skip("quantile takes in an extra arg and is tested separately")
     expr = getattr(pl.col("a"), agg)()
     q = df.select(expr)
 
@@ -72,6 +72,14 @@ def test_quantile(df, q, interp):
         with pytest.raises(AssertionError):
             assert_gpu_result_equal(q)
     assert_gpu_result_equal(q, check_dtypes=check_dtypes, check_exact=False)
+
+
+def test_quantile_invalid_q(df):
+    expr = pl.col("a").quantile(pl.col("a"))
+    q = df.select(expr)
+    with pytest.raises(pl.exceptions.ComputeError, match="cudf-polars only supports expressions that evaluate to a scalar as the quantile argument"):
+        q.collect(post_opt_callback=execute_with_cudf)
+
 
 
 @pytest.mark.parametrize(
