@@ -87,9 +87,11 @@ def _(
 def _(
     node: pl_ir.Scan, visitor: NodeTraverser, schema: dict[str, plc.DataType]
 ) -> ir.IR:
+    typ, *options = node.scan_type
     return ir.Scan(
         schema,
-        node.scan_type,
+        typ,
+        tuple(options),
         node.paths,
         node.file_options,
         translate_named_expr(visitor, n=node.predicate)
