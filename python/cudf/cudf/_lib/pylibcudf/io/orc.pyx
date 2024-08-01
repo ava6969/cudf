@@ -209,7 +209,7 @@ cpdef TableWithMetadata read_orc(
     list columns = None,
     list stripes = None,
     size_type skip_rows = 0,
-    size_type num_rows = -1,
+    size_type nrows = -1,
     bool use_index = True,
     bool use_np_dtypes = True,
     DataType timestamp_type = DataType(type_id.EMPTY),
@@ -228,7 +228,7 @@ cpdef TableWithMetadata read_orc(
         List of stripes to be read.
     skip_rows : int64_t, default 0
         The number of rows to skip from the start of the file.
-    num_rows : size_type, default -1
+    nrows : size_type, default -1
         The number of rows to read. By default, read the entire file.
     use_index : bool, default True
         Whether to use the row index to speed up reading.
@@ -247,8 +247,8 @@ cpdef TableWithMetadata read_orc(
         .use_index(use_index)
         .build()
     )
-    if num_rows >= 0:
-        opts.set_num_rows(num_rows)
+    if nrows >= 0:
+        opts.set_num_rows(nrows)
     if skip_rows >= 0:
         opts.set_skip_rows(skip_rows)
     if stripes is not None:
