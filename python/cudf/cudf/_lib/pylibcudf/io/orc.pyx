@@ -213,9 +213,32 @@ cpdef TableWithMetadata read_orc(
     bool use_index = True,
     bool use_np_dtypes = True,
     DataType timestamp_type = DataType(type_id.EMPTY),
-    list decimal128_columns = None,
+    # Disabled for now, to be re-enabled if there is demand
+    # list decimal128_columns = None,
 ):
-    """
+    """Reads an ORC file into a :py:class:`~.types.TableWithMetadata`.
+
+    Parameters
+    ----------
+    source_info : SourceInfo
+        The SourceInfo object to read the Parquet file from.
+    columns : list, default None
+        The string names of the columns to be read.
+    stripes : list[list[size_type]], default None
+        List of stripes to be read.
+    skip_rows : int64_t, default 0
+        The number of rows to skip from the start of the file.
+    num_rows : size_type, default -1
+        The number of rows to read. By default, read the entire file.
+    use_index : bool, default True
+        Whether to use the row index to speed up reading.
+    use_np_dtypes : bool, default True
+        Whether to use numpy compatible dtypes.
+
+    Returns
+    -------
+    TableWithMetadata
+        The Table and its corresponding metadata (column names) that were read in.
     """
     cdef orc_reader_options opts
     cdef vector[vector[size_type]] c_stripes

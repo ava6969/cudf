@@ -327,7 +327,7 @@ CUDF_KERNEL void count_delimiters_kernel(Tokenizer tokenizer,
   auto const total = block_reduce(temp_storage).Reduce(count, cub::Sum());
 
   if ((lane_idx == 0) && (total > 0)) {
-    cuda::atomic_ref<int64_t, cuda::thread_scope_block> ref{*d_output};
+    cuda::atomic_ref<int64_t, cuda::thread_scope_device> ref{*d_output};
     ref.fetch_add(total, cuda::std::memory_order_relaxed);
   }
 }
@@ -357,6 +357,12 @@ std::pair<std::unique_ptr<column>, rmm::device_uvector<string_index_pair>> split
   auto const chars_bytes =
     get_offset_value(input.offsets(), input.offset() + strings_count, stream) -
     get_offset_value(input.offsets(), input.offset(), stream);
+  if (chars_bytes == 0) {
+    auto offsets = cudf::make_column_from_scalar(
+      numeric_scalar<int32_t>(0, true, stream), strings_count + 1, stream, mr);
+    auto tokens = rmm::device_uvector<string_index_pair>(0, stream);
+    return std::pair{std::move(offsets), std::move(tokens)};
+  }
   auto const d_offsets =
     cudf::detail::offsetalator_factory::make_input_iterator(input.offsets(), input.offset());
 

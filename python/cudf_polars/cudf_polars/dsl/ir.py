@@ -17,14 +17,14 @@ import dataclasses
 import itertools
 import types
 from functools import cache
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, NoReturn
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, ClassVar
 
 import pyarrow as pa
 from typing_extensions import assert_never
 
 import polars as pl
 
-import cudf
 import cudf._lib.pylibcudf as plc
 
 import cudf_polars.dsl.expr as expr
@@ -56,7 +56,6 @@ __all__ = [
     "MapFunction",
     "Union",
     "HConcat",
-    "ExtContext",
 ]
 
 
@@ -96,6 +95,8 @@ def broadcast(
     ``target_length`` is provided and not all columns are length-1
     (i.e. ``n != 1``), then ``target_length`` must be equal to ``n``.
     """
+    if len(columns) == 0:
+        return []
     lengths: set[int] = {column.obj.size() for column in columns}
     if lengths == {1}:
         if target_length is None:
@@ -124,12 +125,17 @@ def broadcast(
     ]
 
 
-@dataclasses.dataclass(slots=True)
+@dataclasses.dataclass
 class IR:
     """Abstract plan node, representing an unevaluated dataframe."""
 
     schema: Schema
     """Mapping from column names to their data types."""
+
+    def __post_init__(self):
+        """Validate preconditions."""
+        if any(dtype.id() == plc.TypeId.EMPTY for dtype in self.schema.values()):
+            raise NotImplementedError("Cannot make empty columns.")
 
     def evaluate(self, *, cache: MutableMapping[int, DataFrame]) -> DataFrame:
         """
@@ -153,10 +159,12 @@ class IR:
             since the translation phase should pick up things that we
             cannot handle.
         """
-        raise NotImplementedError
+        raise NotImplementedError(
+            f"Evaluation of plan {type(self).__name__}"
+        )  # pragma: no cover
 
 
-@dataclasses.dataclass(slots=True)
+@dataclasses.dataclass
 class PythonScan(IR):
     """Representation of input from a python function."""
 
@@ -170,12 +178,16 @@ class PythonScan(IR):
         raise NotImplementedError("PythonScan not implemented")
 
 
-@dataclasses.dataclass(slots=True)
+@dataclasses.dataclass
 class Scan(IR):
     """Input from files."""
 
-    typ: Any
+    typ: str
     """What type of file are we reading? Parquet, CSV, etc..."""
+    reader_options: dict[str, Any]
+    """Reader-specific options, as dictionary."""
+    cloud_options: dict[str, Any] | None
+    """Cloud-related authentication options, currently ignored."""
     paths: list[str]
     """List of paths to read from."""
     file_options: Any
@@ -192,29 +204,162 @@ class Scan(IR):
 
     def __post_init__(self) -> None:
         """Validate preconditions."""
-        if self.file_options.n_rows is not None:
-            raise NotImplementedError("row limit in scan")
-        if self.typ not in ("csv", "parquet"):
+        if self.typ not in ("csv", "parquet", "ndjson"):  # pragma: no cover
+            # This line is unhittable ATM since IPC/Anonymous scan raise
+            # on the polars side
             raise NotImplementedError(f"Unhandled scan type: {self.typ}")
+        if self.typ == "ndjson" and self.file_options.n_rows is not None:
+            raise NotImplementedError("row limit in scan")
+        if self.cloud_options is not None and any(
+            self.cloud_options.get(k) is not None for k in ("aws", "azure", "gcp")
+        ):
+            raise NotImplementedError(
+                "Read from cloud storage"
+            )  # pragma: no cover; no test yet
+        if self.typ == "csv":
+            if self.reader_options["skip_rows_after_header"] != 0:
+                raise NotImplementedError("Skipping rows after header in CSV reader")
+            parse_options = self.reader_options["parse_options"]
+            if (
+                null_values := parse_options["null_values"]
+            ) is not None and "Named" in null_values:
+                raise NotImplementedError(
+                    "Per column null value specification not supported for CSV reader"
+                )
+            if (
+                comment := parse_options["comment_prefix"]
+            ) is not None and "Multi" in comment:
+                raise NotImplementedError(
+                    "Multi-character comment prefix not supported for CSV reader"
+                )
+            if not self.reader_options["has_header"]:
+                # Need to do some file introspection to get the number
+                # of columns so that column projection works right.
+                raise NotImplementedError("Reading CSV without header")
+        elif self.typ == "ndjson":
+            # TODO: consider handling the low memory option here
+            # (maybe use chunked JSON reader)
+            if self.reader_options["ignore_errors"]:
+                raise NotImplementedError(
+                    "ignore_errors is not supported in the JSON reader"
+                )
 
     def evaluate(self, *, cache: MutableMapping[int, DataFrame]) -> DataFrame:
         """Evaluate and return a dataframe."""
         options = self.file_options
         with_columns = options.with_columns
         row_index = options.row_index
+        nrows = self.file_options.n_rows if self.file_options.n_rows is not None else -1
         if self.typ == "csv":
-            df = DataFrame.from_cudf(
-                cudf.concat(
-                    [cudf.read_csv(p, usecols=with_columns) for p in self.paths]
+            parse_options = self.reader_options["parse_options"]
+            sep = chr(parse_options["separator"])
+            quote = chr(parse_options["quote_char"])
+            eol = chr(parse_options["eol_char"])
+            if self.reader_options["schema"] is not None:
+                # Reader schema provides names
+                column_names = list(self.reader_options["schema"]["inner"].keys())
+            else:
+                # file provides column names
+                column_names = None
+            usecols = with_columns
+            # TODO: support has_header=False
+            header = 0
+
+            # polars defaults to no null recognition
+            null_values = [""]
+            if parse_options["null_values"] is not None:
+                ((typ, nulls),) = parse_options["null_values"].items()
+                if typ == "AllColumnsSingle":
+                    # Single value
+                    null_values.append(nulls)
+                else:
+                    # List of values
+                    null_values.extend(nulls)
+            if parse_options["comment_prefix"] is not None:
+                comment = chr(parse_options["comment_prefix"]["Single"])
+            else:
+                comment = None
+            decimal = "," if parse_options["decimal_comma"] else "."
+
+            # polars skips blank lines at the beginning of the file
+            pieces = []
+            for p in self.paths:
+                skiprows = self.reader_options["skip_rows"]
+                path = Path(p)
+                with path.open() as f:
+                    while f.readline() == "\n":
+                        skiprows += 1
+                tbl_w_meta = plc.io.csv.read_csv(
+                    plc.io.SourceInfo([path]),
+                    delimiter=sep,
+                    quotechar=quote,
+                    lineterminator=eol,
+                    col_names=column_names,
+                    header=header,
+                    usecols=usecols,
+                    na_filter=True,
+                    na_values=null_values,
+                    keep_default_na=False,
+                    skiprows=skiprows,
+                    comment=comment,
+                    decimal=decimal,
+                    dtypes=self.schema,
+                    nrows=nrows,
+                )
+                pieces.append(tbl_w_meta)
+            tables, colnames = zip(
+                *(
+                    (piece.tbl, piece.column_names(include_children=False))
+                    for piece in pieces
                 )
             )
+            df = DataFrame.from_table(
+                plc.concatenate.concatenate(list(tables)),
+                colnames[0],
+            )
         elif self.typ == "parquet":
-            cdf = cudf.read_parquet(self.paths, columns=with_columns)
-            assert isinstance(cdf, cudf.DataFrame)
-            df = DataFrame.from_cudf(cdf)
+            tbl_w_meta = plc.io.parquet.read_parquet(
+                plc.io.SourceInfo(self.paths),
+                columns=with_columns,
+                num_rows=nrows,
+            )
+            df = DataFrame.from_table(
+                tbl_w_meta.tbl,
+                # TODO: consider nested column names?
+                tbl_w_meta.column_names(include_children=False),
+            )
+        elif self.typ == "ndjson":
+            json_schema: list[tuple[str, str, list]] = [
+                (name, typ, []) for name, typ in self.schema.items()
+            ]
+            plc_tbl_w_meta = plc.io.json.read_json(
+                plc.io.SourceInfo(self.paths),
+                lines=True,
+                dtypes=json_schema,
+                prune_columns=True,
+            )
+            # TODO: I don't think cudf-polars supports nested types in general right now
+            # (but when it does, we should pass child column names from nested columns in)
+            df = DataFrame.from_table(
+                plc_tbl_w_meta.tbl, plc_tbl_w_meta.column_names(include_children=False)
+            )
+            col_order = list(self.schema.keys())
+            # TODO: remove condition when dropping support for polars 1.0
+            # https://github.com/pola-rs/polars/pull/17363
+            if row_index is not None and row_index[0] in self.schema:
+                col_order.remove(row_index[0])
+            if col_order is not None:
+                df = df.select(col_order)
         else:
-            assert_never(self.typ)
-        if row_index is not None:
+            raise NotImplementedError(
+                f"Unhandled scan type: {self.typ}"
+            )  # pragma: no cover; post init trips first
+        if (
+            row_index is not None
+            # TODO: remove condition when dropping support for polars 1.0
+            # https://github.com/pola-rs/polars/pull/17363
+            and row_index[0] in self.schema
+        ):
             name, offset = row_index
             dtype = self.schema[name]
             step = plc.interop.from_arrow(
@@ -231,13 +376,7 @@ class Scan(IR):
                 null_order=plc.types.NullOrder.AFTER,
             )
             df = DataFrame([index, *df.columns])
-        # TODO: should be true, but not the case until we get
-        # cudf-classic out of the loop for IO since it converts date32
-        # to datetime.
-        # assert all(
-        #     c.obj.type() == dtype
-        #     for c, dtype in zip(df.columns, self.schema.values())
-        # )
+        assert all(c.obj.type() == self.schema[c.name] for c in df.columns)
         if self.predicate is None:
             return df
         else:
@@ -245,7 +384,7 @@ class Scan(IR):
             return df.filter(mask)
 
 
-@dataclasses.dataclass(slots=True)
+@dataclasses.dataclass
 class Cache(IR):
     """
     Return a cached plan node.
@@ -266,7 +405,7 @@ class Cache(IR):
             return cache.setdefault(self.key, self.value.evaluate(cache=cache))
 
 
-@dataclasses.dataclass(slots=True)
+@dataclasses.dataclass
 class DataFrameScan(IR):
     """
     Input from an existing polars DataFrame.
@@ -286,17 +425,7 @@ class DataFrameScan(IR):
         pdf = pl.DataFrame._from_pydf(self.df)
         if self.projection is not None:
             pdf = pdf.select(self.projection)
-        # TODO: goes away when libcudf supports large strings
-        table = pdf.to_arrow()
-        schema = table.schema
-        for i, field in enumerate(schema):
-            if field.type == pa.large_string():
-                # TODO: Nested types
-                schema = schema.set(i, pa.field(field.name, pa.string()))
-        table = table.cast(schema)
-        df = DataFrame.from_table(
-            plc.interop.from_arrow(table), list(self.schema.keys())
-        )
+        df = DataFrame.from_polars(pdf)
         assert all(
             c.obj.type() == dtype for c, dtype in zip(df.columns, self.schema.values())
         )
@@ -307,7 +436,7 @@ class DataFrameScan(IR):
             return df
 
 
-@dataclasses.dataclass(slots=True)
+@dataclasses.dataclass
 class Select(IR):
     """Produce a new dataframe selecting given expressions from an input."""
 
@@ -328,7 +457,7 @@ class Select(IR):
         return DataFrame(columns)
 
 
-@dataclasses.dataclass(slots=True)
+@dataclasses.dataclass
 class Reduce(IR):
     """
     Produce a new dataframe selecting given expressions from an input.
@@ -341,7 +470,9 @@ class Reduce(IR):
     expr: list[expr.NamedExpr]
     """List of expressions to evaluate to form the new dataframe."""
 
-    def evaluate(self, *, cache: MutableMapping[int, DataFrame]) -> DataFrame:
+    def evaluate(
+        self, *, cache: MutableMapping[int, DataFrame]
+    ) -> DataFrame:  # pragma: no cover; polars doesn't emit this node yet
         """Evaluate and return a dataframe."""
         df = self.df.evaluate(cache=cache)
         columns = broadcast(*(e.evaluate(df) for e in self.expr))
@@ -379,7 +510,7 @@ def placeholder_column(n: int) -> plc.Column:
     )
 
 
-@dataclasses.dataclass(slots=False)
+@dataclasses.dataclass
 class GroupBy(IR):
     """Perform a groupby."""
 
@@ -414,13 +545,11 @@ class GroupBy(IR):
         NotImplementedError
             For unsupported expression nodes.
         """
-        if isinstance(agg, (expr.BinOp, expr.Cast)):
+        if isinstance(agg, (expr.BinOp, expr.Cast, expr.UnaryFunction)):
             return max(GroupBy.check_agg(child) for child in agg.children)
         elif isinstance(agg, expr.Agg):
-            if agg.name == "implode":
-                raise NotImplementedError("implode in groupby")
             return 1 + max(GroupBy.check_agg(child) for child in agg.children)
-        elif isinstance(agg, (expr.Len, expr.Col, expr.Literal)):
+        elif isinstance(agg, (expr.Len, expr.Col, expr.Literal, expr.LiteralColumn)):
             return 0
         else:
             raise NotImplementedError(f"No handler for {agg=}")
@@ -430,7 +559,9 @@ class GroupBy(IR):
         if self.options.rolling is None and self.maintain_order:
             raise NotImplementedError("Maintaining order in groupby")
         if self.options.rolling:
-            raise NotImplementedError("rolling window/groupby")
+            raise NotImplementedError(
+                "rolling window/groupby"
+            )  # pragma: no cover; rollingwindow constructor has already raised
         if any(GroupBy.check_agg(a.value) > 1 for a in self.agg_requests):
             raise NotImplementedError("Nested aggregations in groupby")
         self.agg_infos = [req.collect_agg(depth=0) for req in self.agg_requests]
@@ -441,16 +572,17 @@ class GroupBy(IR):
         keys = broadcast(
             *(k.evaluate(df) for k in self.keys), target_length=df.num_rows
         )
-        # TODO: use sorted information, need to expose column_order
-        # and null_precedence in pylibcudf groupby constructor
-        # sorted = (
-        #     plc.types.Sorted.YES
-        #     if all(k.is_sorted for k in keys)
-        #     else plc.types.Sorted.NO
-        # )
+        sorted = (
+            plc.types.Sorted.YES
+            if all(k.is_sorted for k in keys)
+            else plc.types.Sorted.NO
+        )
         grouper = plc.groupby.GroupBy(
             plc.Table([k.obj for k in keys]),
             null_handling=plc.types.NullPolicy.INCLUDE,
+            keys_are_sorted=sorted,
+            column_order=[k.order for k in keys],
+            null_precedence=[k.null_order for k in keys],
         )
         # TODO: uniquify
         requests = []
@@ -477,10 +609,10 @@ class GroupBy(IR):
         results = [
             req.evaluate(result_subs, mapping=mapping) for req in self.agg_requests
         ]
-        return DataFrame([*result_keys, *results]).slice(self.options.slice)
+        return DataFrame(broadcast(*result_keys, *results)).slice(self.options.slice)
 
 
-@dataclasses.dataclass(slots=True)
+@dataclasses.dataclass
 class Join(IR):
     """A join of two dataframes."""
 
@@ -493,7 +625,7 @@ class Join(IR):
     right_on: list[expr.NamedExpr]
     """List of expressions used as keys in the right frame."""
     options: tuple[
-        Literal["inner", "left", "full", "leftsemi", "leftanti"],
+        Literal["inner", "left", "full", "leftsemi", "leftanti", "cross"],
         bool,
         tuple[int, int] | None,
         str | None,
@@ -510,11 +642,14 @@ class Join(IR):
 
     def __post_init__(self) -> None:
         """Validate preconditions."""
-        if self.options[0] == "cross":
-            raise NotImplementedError("cross join not implemented")
+        if any(
+            isinstance(e.value, expr.Literal)
+            for e in itertools.chain(self.left_on, self.right_on)
+        ):
+            raise NotImplementedError("Join with literal as join key.")
 
-    @cache
     @staticmethod
+    @cache
     def _joiners(
         how: Literal["inner", "left", "full", "leftsemi", "leftanti"],
     ) -> tuple[
@@ -553,39 +688,104 @@ class Join(IR):
         else:
             assert_never(how)
 
+    def _reorder_maps(
+        self,
+        left_rows: int,
+        lg: plc.Column,
+        left_policy: plc.copying.OutOfBoundsPolicy,
+        right_rows: int,
+        rg: plc.Column,
+        right_policy: plc.copying.OutOfBoundsPolicy,
+    ) -> list[plc.Column]:
+        """
+        Reorder gather maps to satisfy polars join order restrictions.
+
+        Parameters
+        ----------
+        left_rows
+            Number of rows in left table
+        lg
+            Left gather map
+        left_policy
+            Nullify policy for left map
+        right_rows
+            Number of rows in right table
+        rg
+            Right gather map
+        right_policy
+            Nullify policy for right map
+
+        Returns
+        -------
+        list of reordered left and right gather maps.
+
+        Notes
+        -----
+        For a left join, the polars result preserves the order of the
+        left keys, and is stable wrt the right keys. For all other
+        joins, there is no order obligation.
+        """
+        dt = plc.interop.to_arrow(plc.types.SIZE_TYPE)
+        init = plc.interop.from_arrow(pa.scalar(0, type=dt))
+        step = plc.interop.from_arrow(pa.scalar(1, type=dt))
+        left_order = plc.copying.gather(
+            plc.Table([plc.filling.sequence(left_rows, init, step)]), lg, left_policy
+        )
+        right_order = plc.copying.gather(
+            plc.Table([plc.filling.sequence(right_rows, init, step)]), rg, right_policy
+        )
+        return plc.sorting.stable_sort_by_key(
+            plc.Table([lg, rg]),
+            plc.Table([*left_order.columns(), *right_order.columns()]),
+            [plc.types.Order.ASCENDING, plc.types.Order.ASCENDING],
+            [plc.types.NullOrder.AFTER, plc.types.NullOrder.AFTER],
+        ).columns()
+
     def evaluate(self, *, cache: MutableMapping[int, DataFrame]) -> DataFrame:
         """Evaluate and return a dataframe."""
         left = self.left.evaluate(cache=cache)
         right = self.right.evaluate(cache=cache)
-        left_on = DataFrame(
-            broadcast(
-                *(e.evaluate(left) for e in self.left_on), target_length=left.num_rows
-            )
-        )
-        right_on = DataFrame(
-            broadcast(
-                *(e.evaluate(right) for e in self.right_on),
-                target_length=right.num_rows,
-            )
-        )
         how, join_nulls, zlice, suffix, coalesce = self.options
+        suffix = "_right" if suffix is None else suffix
+        if how == "cross":
+            # Separate implementation, since cross_join returns the
+            # result, not the gather maps
+            columns = plc.join.cross_join(left.table, right.table).columns()
+            left_cols = [
+                NamedColumn(new, old.name).sorted_like(old)
+                for new, old in zip(columns[: left.num_columns], left.columns)
+            ]
+            right_cols = [
+                NamedColumn(
+                    new,
+                    old.name
+                    if old.name not in left.column_names_set
+                    else f"{old.name}{suffix}",
+                )
+                for new, old in zip(columns[left.num_columns :], right.columns)
+            ]
+            return DataFrame([*left_cols, *right_cols])
+        # TODO: Waiting on clarity based on https://github.com/pola-rs/polars/issues/17184
+        left_on = DataFrame(broadcast(*(e.evaluate(left) for e in self.left_on)))
+        right_on = DataFrame(broadcast(*(e.evaluate(right) for e in self.right_on)))
         null_equality = (
             plc.types.NullEquality.EQUAL
             if join_nulls
             else plc.types.NullEquality.UNEQUAL
         )
-        suffix = "_right" if suffix is None else suffix
         join_fn, left_policy, right_policy = Join._joiners(how)
         if right_policy is None:
             # Semi join
             lg = join_fn(left_on.table, right_on.table, null_equality)
-            left = left.replace_columns(*left_on.columns)
             table = plc.copying.gather(left.table, lg, left_policy)
             result = DataFrame.from_table(table, left.column_names)
         else:
             lg, rg = join_fn(left_on.table, right_on.table, null_equality)
-            left = left.replace_columns(*left_on.columns)
-            right = right.replace_columns(*right_on.columns)
+            if how == "left":
+                # Order of left table is preserved
+                lg, rg = self._reorder_maps(
+                    left.num_rows, lg, left_policy, right.num_rows, rg, right_policy
+                )
             if coalesce and how == "inner":
                 right = right.discard_columns(right_on.column_names_set)
             left = DataFrame.from_table(
@@ -619,7 +819,7 @@ class Join(IR):
         return result.slice(zlice)
 
 
-@dataclasses.dataclass(slots=True)
+@dataclasses.dataclass
 class HStack(IR):
     """Add new columns to a dataframe."""
 
@@ -648,7 +848,7 @@ class HStack(IR):
         return df.with_columns(columns)
 
 
-@dataclasses.dataclass(slots=True)
+@dataclasses.dataclass
 class Distinct(IR):
     """Produce a new dataframe with distinct rows."""
 
@@ -718,7 +918,7 @@ class Distinct(IR):
         return result.slice(self.zlice)
 
 
-@dataclasses.dataclass(slots=True)
+@dataclasses.dataclass
 class Sort(IR):
     """Sort a dataframe."""
 
@@ -787,7 +987,7 @@ class Sort(IR):
         return DataFrame(columns).slice(self.zlice)
 
 
-@dataclasses.dataclass(slots=True)
+@dataclasses.dataclass
 class Slice(IR):
     """Slice a dataframe."""
 
@@ -804,7 +1004,7 @@ class Slice(IR):
         return df.slice((self.offset, self.length))
 
 
-@dataclasses.dataclass(slots=True)
+@dataclasses.dataclass
 class Filter(IR):
     """Filter a dataframe with a boolean mask."""
 
@@ -820,7 +1020,7 @@ class Filter(IR):
         return df.filter(mask)
 
 
-@dataclasses.dataclass(slots=True)
+@dataclasses.dataclass
 class Projection(IR):
     """Select a subset of columns from a dataframe."""
 
@@ -837,7 +1037,7 @@ class Projection(IR):
         return DataFrame(columns)
 
 
-@dataclasses.dataclass(slots=True)
+@dataclasses.dataclass
 class MapFunction(IR):
     """Apply some function to a dataframe."""
 
@@ -850,9 +1050,11 @@ class MapFunction(IR):
 
     _NAMES: ClassVar[frozenset[str]] = frozenset(
         [
-            "drop_nulls",
             "rechunk",
-            "merge_sorted",
+            # libcudf merge is not stable wrt order of inputs, since
+            # it uses a priority queue to manage the tables it produces.
+            # See: https://github.com/rapidsai/cudf/issues/16010
+            # "merge_sorted",
             "rename",
             "explode",
         ]
@@ -869,46 +1071,20 @@ class MapFunction(IR):
                 # polars requires that all to-explode columns have the
                 # same sub-shapes
                 raise NotImplementedError("Explode with more than one column")
-        elif self.name == "merge_sorted":
-            assert isinstance(self.df, Union)
-            (key_column,) = self.options
-            if key_column not in self.df.dfs[0].schema:
-                raise ValueError(f"Key column {key_column} not found")
+        elif self.name == "rename":
+            old, new, _ = self.options
+            # TODO: perhaps polars should validate renaming in the IR?
+            if len(new) != len(set(new)) or (
+                set(new) & (set(self.df.schema.keys() - set(old)))
+            ):
+                raise NotImplementedError("Duplicate new names in rename.")
 
     def evaluate(self, *, cache: MutableMapping[int, DataFrame]) -> DataFrame:
         """Evaluate and return a dataframe."""
-        if self.name == "merge_sorted":
-            # merge_sorted operates on Union inputs
-            # but if we evaluate the Union then we can't unpick the
-            # pieces, so we dive inside and evaluate the pieces by hand
-            assert isinstance(self.df, Union)
-            first, *rest = (c.evaluate(cache=cache) for c in self.df.dfs)
-            (key_column,) = self.options
-            if not all(first.column_names == r.column_names for r in rest):
-                raise ValueError("DataFrame shapes/column names don't match")
-            # Already validated that key_column is in column names
-            index = first.column_names.index(key_column)
-            return DataFrame.from_table(
-                plc.merge.merge_sorted(
-                    [first.table, *(df.table for df in rest)],
-                    [index],
-                    [plc.types.Order.ASCENDING],
-                    [plc.types.NullOrder.BEFORE],
-                ),
-                first.column_names,
-            ).sorted_like(first, subset={key_column})
-        elif self.name == "rechunk":
+        if self.name == "rechunk":
             # No-op in our data model
-            return self.df.evaluate(cache=cache)
-        elif self.name == "drop_nulls":
-            df = self.df.evaluate(cache=cache)
-            (subset,) = self.options
-            subset = set(subset)
-            indices = [i for i, name in enumerate(df.column_names) if name in subset]
-            return DataFrame.from_table(
-                plc.stream_compaction.drop_nulls(df.table, indices, len(indices)),
-                df.column_names,
-            ).sorted_like(df)
+            # Don't think this appears in a plan tree from python
+            return self.df.evaluate(cache=cache)  # pragma: no cover
         elif self.name == "rename":
             df = self.df.evaluate(cache=cache)
             # final tag is "swapping" which is useful for the
@@ -924,10 +1100,10 @@ class MapFunction(IR):
                 plc.lists.explode_outer(df.table, index), df.column_names
             ).sorted_like(df, subset=subset)
         else:
-            raise AssertionError("Should never be reached")
+            raise AssertionError("Should never be reached")  # pragma: no cover
 
 
-@dataclasses.dataclass(slots=True)
+@dataclasses.dataclass
 class Union(IR):
     """Concatenate dataframes vertically."""
 
@@ -951,36 +1127,55 @@ class Union(IR):
         ).slice(self.zlice)
 
 
-@dataclasses.dataclass(slots=True)
+@dataclasses.dataclass
 class HConcat(IR):
     """Concatenate dataframes horizontally."""
 
     dfs: list[IR]
     """List of inputs."""
 
+    @staticmethod
+    def _extend_with_nulls(table: plc.Table, *, nrows: int) -> plc.Table:
+        """
+        Extend a table with nulls.
+
+        Parameters
+        ----------
+        table
+            Table to extend
+        nrows
+            Number of additional rows
+
+        Returns
+        -------
+        New pylibcudf table.
+        """
+        return plc.concatenate.concatenate(
+            [
+                table,
+                plc.Table(
+                    [
+                        plc.Column.all_null_like(column, nrows)
+                        for column in table.columns()
+                    ]
+                ),
+            ]
+        )
+
     def evaluate(self, *, cache: MutableMapping[int, DataFrame]) -> DataFrame:
         """Evaluate and return a dataframe."""
         dfs = [df.evaluate(cache=cache) for df in self.dfs]
+        max_rows = max(df.num_rows for df in dfs)
+        # Horizontal concatenation extends shorter tables with nulls
+        dfs = [
+            df
+            if df.num_rows == max_rows
+            else DataFrame.from_table(
+                self._extend_with_nulls(df.table, nrows=max_rows - df.num_rows),
+                df.column_names,
+            )
+            for df in dfs
+        ]
         return DataFrame(
             list(itertools.chain.from_iterable(df.columns for df in dfs)),
-        )
-
-
-@dataclasses.dataclass(slots=True)
-class ExtContext(IR):
-    """
-    Concatenate dataframes horizontally.
-
-    Prefer HConcat, since this is going to be deprecated on the polars side.
-    """
-
-    df: IR
-    """Input."""
-    extra: list[IR]
-    """List of extra inputs."""
-
-    def __post_init__(self) -> NoReturn:
-        """Validate preconditions."""
-        raise NotImplementedError(
-            "ExtContext will be deprecated, use horizontal concat instead."
         )

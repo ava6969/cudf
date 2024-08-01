@@ -24,7 +24,7 @@ cpdef TableWithMetadata read_orc(
     bool use_index = *,
     bool use_np_dtypes = *,
     DataType timestamp_type = *,
-    list decimal128_columns = *
+    # list decimal128_columns = *
 )
 
 cdef class OrcColumnStatistics:

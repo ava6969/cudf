@@ -121,7 +121,7 @@ cpdef read_orc(object filepaths_or_buffers,
         )
     )
 
-    names = tbl_w_meta.column_names
+    names = tbl_w_meta.column_names(include_children=False)
 
     actual_index_names, col_names, is_range_index, reset_index_name, \
         range_idx = _get_index_from_metadata(tbl_w_meta.per_file_user_data,
