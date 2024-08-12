@@ -857,9 +857,6 @@ def _parquet_to_frame(
     skip_rows=None,
     **kwargs,
 ):
-    print(
-        f"_parquet_to_frame_parquet_to_frame() - paths_or_buffers: {paths_or_buffers}"
-    )
     # If this is not a partitioned read, only need
     # one call to `_read_parquet`
     if not partition_keys:

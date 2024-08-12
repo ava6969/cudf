@@ -429,13 +429,12 @@ class user_datasource_wrapper : public datasource {
 };
 
 /**
- * @brief
+ * @brief Remote file source backed by KvikIO, which handles S3 filepaths seamlessly.
  */
 class remote_file_source : public datasource {
  public:
   explicit remote_file_source(char const* filepath)
   {
-    std::cout << "remote_file_source() - filepath: " << filepath << std::endl;
     detail::force_init_cuda_context();
     CUDF_EXPECTS(cufile_integration::is_kvikio_enabled(),
                  "Please enable kvikio to access S3 files.");
@@ -503,6 +502,7 @@ std::unique_ptr<datasource> datasource::create(std::string const& filepath,
                                                size_t offset,
                                                size_t size)
 {
+  // If this is a S3 filepath (i.e. "s3://<bucket>/<object>"), we create a remote file source
   if (filepath.size() > 5 && filepath.substr(0, 5) == "s3://") {
     return std::make_unique<remote_file_source>(filepath.c_str());
   }
