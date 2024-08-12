@@ -133,6 +133,12 @@ def pdf_ext(scope="module"):
     return df
 
 
+@pytest.fixture(params=[True, False])
+def native_s3_io(request):
+    with cudf.option_context("native_s3_io", request.param):
+        yield request.param
+
+
 @pytest.mark.parametrize("bytes_per_thread", [32, 1024])
 def test_read_csv(s3_base, s3so, pdf, bytes_per_thread):
     # Write to buffer
@@ -231,16 +237,15 @@ def test_write_csv(s3_base, s3so, pdf, chunksize):
 @pytest.mark.parametrize("columns", [None, ["Float", "String"]])
 @pytest.mark.parametrize("precache", [None, "parquet"])
 @pytest.mark.parametrize("use_python_file_object", [True, False])
-@pytest.mark.parametrize("use_kvikio_s3", [True, False])
 def test_read_parquet(
     s3_base,
     s3so,
     pdf,
+    native_s3_io,
     bytes_per_thread,
     columns,
     precache,
     use_python_file_object,
-    use_kvikio_s3,
 ):
     fname = "test_parquet_reader.parquet"
     bucket = "parquet"
@@ -262,7 +267,6 @@ def test_read_parquet(
                 bytes_per_thread=bytes_per_thread,
                 columns=columns,
                 use_python_file_object=use_python_file_object,
-                use_kvikio_s3=use_kvikio_s3,
             )
     expect = pdf[columns] if columns else pdf
     assert_eq(expect, got1)

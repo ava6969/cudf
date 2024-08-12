@@ -543,12 +543,10 @@ def read_parquet(
     dataset_kwargs=None,
     nrows=None,
     skip_rows=None,
-    use_kvikio_s3=None,
     *args,
     **kwargs,
 ):
     """{docstring}"""
-    import s3fs.core
 
     if engine not in {"cudf", "pyarrow"}:
         raise ValueError(
@@ -584,9 +582,6 @@ def read_parquet(
     if columns is not None:
         if not is_list_like(columns):
             raise ValueError("Expected list like for columns")
-
-    if use_kvikio_s3 is None:
-        use_kvikio_s3 = cudf.options.get_option("kvikio_s3")
 
     # Start by trying construct a filesystem object, so we
     # can apply filters on remote file-systems
@@ -630,21 +625,27 @@ def read_parquet(
     have_nativefile = any(
         isinstance(source, pa.NativeFile) for source in filepath_or_buffer
     )
-    print(
-        f"read_parquet calling get_reader_filepath_or_buffer() - filepath_or_buffer: {filepath_or_buffer}, fs: {fs}"
-    )
+
+    def _get_native_s3_path(source, fs) -> None | str:
+        """Return a native S3 path (s3://<bucket>/<object>) or None"""
+        if not cudf.options.get_option("native_s3_io"):
+            return None
+        if isinstance(source, str) and source.startswith("s3://"):
+            return source  # Already a native S3 path
+        try:
+            import s3fs.core
+        except ImportError:
+            return None
+        if isinstance(source, s3fs.core.S3File):
+            return source.full_name
+        if isinstance(fs, s3fs.core.S3FileSystem) and isinstance(source, str):
+            return f"s3://{source}"
+        return None
+
     for source in filepath_or_buffer:
         source = ioutils.stringify_pathlike(source)
-        if use_kvikio_s3 and (
-            isinstance(fs, s3fs.core.S3FileSystem)
-            or isinstance(source, s3fs.core.S3File)
-        ):
-            tmp_source = source
-            if isinstance(source, str) and not source.startswith("s3://"):
-                tmp_source = f"s3://{source}"
-            elif isinstance(source, s3fs.core.S3File):
-                tmp_source = source.full_name
-
+        tmp_source = _get_native_s3_path(source, fs)
+        if tmp_source is not None:
             # Trigger future warnings as in `ioutils.get_reader_filepath_or_buffer()`
             if use_python_file_object not in (no_default, None):
                 warnings.warn(

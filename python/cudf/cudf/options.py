@@ -352,11 +352,11 @@ _register_option(
 )
 
 _register_option(
-    "kvikio_s3",
-    _env_get_bool("CUDF_KVIKIO_S3", False),
+    "native_s3_io",
+    _env_get_bool("CUDF_NATIVE_S3_IO", False),
     textwrap.dedent(
         """
-        Whether to use KvikIO's S3 backend or not.
+        Whether to use libcudf's native S3 backend or not.
         \tValid values are True or False. Default is False.
     """
     ),
